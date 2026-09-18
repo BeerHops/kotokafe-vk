@@ -131,13 +131,19 @@ let vkReady=false,storage=localStorage;
 let detectedLocale=navigator.language||'en';
 try{
   if(window.vkBridge){
-    await window.vkBridge.send('VKWebAppInit');
-    vkReady=true;
+    const initResult = await Promise.race([
+      window.vkBridge.send('VKWebAppInit'),
+      new Promise((_, reject)=>setTimeout(()=>reject(new Error('VK init timeout')),1500))
+    ]);
+    vkReady=!!initResult;
     const params=new URLSearchParams(location.search);
     const vkLang=(params.get('vk_language')||params.get('lang')||'').toLowerCase();
     if(vkLang)detectedLocale=vkLang;
   }
-}catch(e){console.info('VK Bridge offline/direct-browser mode',e)}
+}catch(e){
+  vkReady=false;
+  console.info('VK Bridge offline/direct-browser mode',e);
+}
 let state=load(),combo=0,lastTap=0,offlinePending=0,audioCtx=null,lastSave=0,adPlaying=false;
 let lang=state.language||(String(detectedLocale).toLowerCase().startsWith('ru')?'ru':'en');
 state.language=lang;
