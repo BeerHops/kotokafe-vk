@@ -126,7 +126,8 @@ const questTemplates=[
  {type:'earned',icon:'💰',name:{en:'Full register',ru:'Полная касса'},goal:n=>500*Math.pow(4,n),reward:n=>160*Math.pow(3.2,n)},
  {type:'owned',icon:'🏪',name:{en:'Expansion',ru:'Расширение'},goal:n=>5+n*5,reward:n=>220*Math.pow(2.5,n)}
 ];
-const baseState={money:20,totalEarned:0,runEarned:0,taps:0,level:1,xp:0,stars:0,business:{},upgrades:{},quests:[0,0,0],questClaimed:[false,false,false],lastSeen:Date.now(),lastDaily:0,incomeBoostUntil:0,sound:true,vibration:true,language:null};
+const baseState={money:20,totalEarned:0,runEarned:0,taps:0,level:1,xp:0,stars:0,business:{},upgrades:{},quests:[0,0,0],questClaimed:[false,false,false],lastSeen:Date.now(),lastDaily:0,incomeBoostUntil:0,sound:true,vibration:true,language:null,cloudUpdatedAt:0};
+const CLOUD_SAVE_KEY='kotokafe_save_v3';
 let vkReady=false,storage=localStorage;
 let detectedLocale=navigator.language||'en';
 try{
@@ -144,7 +145,7 @@ try{
   vkReady=false;
   console.info('VK Bridge offline/direct-browser mode',e);
 }
-let state=load(),combo=0,lastTap=0,offlinePending=0,audioCtx=null,lastSave=0,adPlaying=false;
+let state=await loadWithCloudSync(),combo=0,lastTap=0,offlinePending=0,audioCtx=null,lastSave=0,adPlaying=false;
 let lang=state.language||(String(detectedLocale).toLowerCase().startsWith('ru')?'ru':'en');
 state.language=lang;
 const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
@@ -170,8 +171,72 @@ function tapValue(){return (1+state.level*.25)*Math.pow(2,state.upgrades.tap||0)
 function xpNeed(){return 25+state.level*state.level*9}
 function totalOwned(){return Object.values(state.business).reduce((a,b)=>a+b,0)}
 function earn(v){state.money+=v;state.totalEarned+=v;state.runEarned+=v}
-function load(){let saved=null;try{saved=storage.getItem(SAVE_KEY)}catch(e){saved=localStorage.getItem(SAVE_KEY)}try{const raw=JSON.parse(saved);return Object.assign({},baseState,raw,{business:Object.assign({},raw?.business),upgrades:Object.assign({},raw?.upgrades)});}catch(e){return structuredClone(baseState)}}
-function save(force=false){const now=Date.now();if(!force&&now-lastSave<4000)return;lastSave=now;state.lastSeen=now;const value=JSON.stringify(state);try{storage.setItem(SAVE_KEY,value)}catch(e){localStorage.setItem(SAVE_KEY,value)}}
+let cloudSaveTimer=null,cloudSaveInFlight=false,pendingCloudSnapshot=null;
+function normalizeState(raw){return Object.assign({},baseState,raw||{},{business:Object.assign({},raw?.business),upgrades:Object.assign({},raw?.upgrades),quests:Array.isArray(raw?.quests)?raw.quests:[0,0,0],questClaimed:Array.isArray(raw?.questClaimed)?raw.questClaimed:[false,false,false],cloudUpdatedAt:Number(raw?.cloudUpdatedAt||0)})}
+function loadLocal(){let saved=null;try{saved=storage.getItem(SAVE_KEY)}catch(e){saved=localStorage.getItem(SAVE_KEY)}try{return normalizeState(JSON.parse(saved))}catch(e){return structuredClone(baseState)}}
+function writeLocal(snapshot){const value=JSON.stringify(snapshot);try{storage.setItem(SAVE_KEY,value)}catch(e){localStorage.setItem(SAVE_KEY,value)}}
+async function readCloud(){
+ if(!vkReady||!window.vkBridge)return null;
+ const data=await window.vkBridge.send('VKWebAppStorageGet',{keys:[CLOUD_SAVE_KEY]});
+ const item=Array.isArray(data?.keys)?data.keys.find(x=>x.key===CLOUD_SAVE_KEY):null;
+ if(!item?.value)return null;
+ return normalizeState(JSON.parse(item.value));
+}
+async function writeCloud(snapshot){
+ if(!vkReady||!window.vkBridge)return false;
+ const value=JSON.stringify(snapshot);
+ const bytes=new Blob([value]).size;
+ if(bytes>3900)throw new Error('VK cloud save is too large: '+bytes+' bytes');
+ await window.vkBridge.send('VKWebAppStorageSet',{key:CLOUD_SAVE_KEY,value});
+ return true;
+}
+async function loadWithCloudSync(){
+ const localState=loadLocal();
+ if(!vkReady||!window.vkBridge)return localState;
+ try{
+   const cloudState=await readCloud();
+   if(!cloudState){
+     localState.cloudUpdatedAt=Date.now();
+     writeLocal(localState);
+     await writeCloud(localState);
+     console.info('VK cloud save created from local progress');
+     return localState;
+   }
+   const localStamp=Number(localState.cloudUpdatedAt||0);
+   const cloudStamp=Number(cloudState.cloudUpdatedAt||0);
+   if(cloudStamp>localStamp){
+     writeLocal(cloudState);
+     console.info('VK cloud progress loaded');
+     return cloudState;
+   }
+   if(localStamp>cloudStamp){
+     await writeCloud(localState);
+     console.info('Newer local progress uploaded to VK cloud');
+   }
+   return localState;
+ }catch(e){
+   console.warn('VK cloud sync unavailable, using local save',e);
+   return localState;
+ }
+}
+function queueCloudSave(force=false){
+ if(!vkReady||!window.vkBridge)return;
+ pendingCloudSnapshot=normalizeState(JSON.parse(JSON.stringify(state)));
+ if(force){
+   if(cloudSaveTimer){clearTimeout(cloudSaveTimer);cloudSaveTimer=null}
+   flushCloudSave();
+ }else if(!cloudSaveTimer){
+   cloudSaveTimer=setTimeout(()=>{cloudSaveTimer=null;flushCloudSave()},8000);
+ }
+}
+async function flushCloudSave(){
+ if(cloudSaveInFlight){if(!cloudSaveTimer)cloudSaveTimer=setTimeout(()=>{cloudSaveTimer=null;flushCloudSave()},1000);return}
+ if(!pendingCloudSnapshot)return;
+ const snapshot=pendingCloudSnapshot;pendingCloudSnapshot=null;cloudSaveInFlight=true;
+ try{await writeCloud(snapshot)}catch(e){console.warn('VK cloud save failed',e);pendingCloudSnapshot=snapshot}
+ finally{cloudSaveInFlight=false;if(pendingCloudSnapshot&&!cloudSaveTimer)cloudSaveTimer=setTimeout(()=>{cloudSaveTimer=null;flushCloudSave()},1500)}
+}
+function save(force=false){const now=Date.now();if(!force&&now-lastSave<4000)return;lastSave=now;state.lastSeen=now;state.cloudUpdatedAt=now;writeLocal(state);queueCloudSave(force)}
 function levelUp(){let did=false;while(state.xp>=xpNeed()){state.xp-=xpNeed();state.level++;earn(state.level*20);did=true}if(did){toast(t('newLevel')+' '+fmt(state.level*20)+' '+t('coinsWord'));sound(660,.12);confetti()}}
 function tap(e){const now=performance.now();combo=now-lastTap<650?Math.min(combo+1,20):1;lastTap=now;const bonus=1+Math.floor(combo/5)*.1;const val=tapValue()*bonus;earn(val);state.taps++;state.xp+=1;levelUp();floatText(e.clientX||innerWidth/2,e.clientY||260,'+'+fmt(val));particles(e.clientX||innerWidth/2,e.clientY||260);$('#cat').classList.add('bop');setTimeout(()=>$('#cat').classList.remove('bop'),100);if(combo>=5){$('#combo').classList.add('show');$('#combo span').textContent=(1+Math.floor(combo/5)*.1).toFixed(1)}else $('#combo').classList.remove('show');sound(310+Math.min(combo,12)*18,.035);if(state.vibration&&navigator.vibrate)navigator.vibrate(8);renderHeader();renderQuests()}
 function floatText(x,y,t){const el=document.createElement('b');el.className='float';el.textContent=t;const r=$('#scene').getBoundingClientRect();el.style.left=Math.max(10,Math.min(r.width-80,x-r.left-22))+'px';el.style.top=Math.max(50,Math.min(r.height-30,y-r.top-20))+'px';$('#scene').append(el);setTimeout(()=>el.remove(),900)}
@@ -218,7 +283,7 @@ $('#prestigeBtn').onclick=doPrestige;$('#dailyBtn').onclick=openDaily;$('#dailyC
 $('#languageBtn').onclick=()=>{lang=lang==='en'?'ru':'en';state.language=lang;applyLanguage();save(true)};
 $('#soundSwitch').onclick=()=>{state.sound=!state.sound;$('#soundSwitch').classList.toggle('on',state.sound);save(true)};$('#vibrationSwitch').onclick=()=>{state.vibration=!state.vibration;$('#vibrationSwitch').classList.toggle('on',state.vibration);save(true)};
 $('#soundSwitch').classList.toggle('on',state.sound);$('#vibrationSwitch').classList.toggle('on',state.vibration);
-document.addEventListener('visibilitychange',()=>{if(document.hidden)save(true)});window.addEventListener('beforeunload',()=>save(true));
+document.addEventListener('visibilitychange',()=>{if(document.hidden){save(true);flushCloudSave()}});window.addEventListener('beforeunload',()=>{save(true);flushCloudSave()});
 setInterval(()=>{if(!adPlaying){const v=income()/10;if(v>0)earn(v)}renderHeader();renderAdBonuses();if(Math.floor(Date.now()/1000)%2===0){renderBusinesses();renderUpgrades();renderQuests()}save()},100);
 setInterval(()=>{if(performance.now()-lastTap>850){combo=0;$('#combo').classList.remove('show')}},500);
 applyLanguage();setupOffline();
@@ -227,3 +292,4 @@ applyLanguage();setupOffline();
 </script>
 </body>
 </html>
+
